@@ -120,12 +120,22 @@ var Stream = function (data) {
 };
 
 var lzwDecode = function (minCodeSize, data) {
-    // TODO: Now that the GIF parser is a bit different, maybe this should get an array of bytes instead of a String?
-    var pos = 0; // Maybe this streaming thing should be merged with the Stream?
+    var bytes: Uint8Array;
+    if (typeof data === 'string') {
+        bytes = new Uint8Array(data.length);
+        for (var bi = 0; bi < data.length; bi++) {
+            bytes[bi] = data.charCodeAt(bi) & 0xff;
+        }
+    } else if (data instanceof Uint8Array) {
+        bytes = data;
+    } else {
+        bytes = new Uint8Array(data);
+    }
+    var pos = 0;
     var readCode = function (size) {
         var code = 0;
         for (var i = 0; i < size; i++) {
-            if (data.charCodeAt(pos >> 3) & (1 << (pos & 7))) {
+            if (bytes[pos >> 3] & (1 << (pos & 7))) {
                 code |= 1 << i;
             }
             pos++;
@@ -216,7 +226,9 @@ var parseGIF = function (st, handler) {
         var hdr: any = {};
         hdr.sig = st.read(3);
         hdr.ver = st.read(3);
-        if (hdr.sig !== 'GIF') throw new Error('Not a GIF file.'); // XXX: This should probably be handled more nicely.
+        if (hdr.sig !== 'GIF') {
+            throw new Error('Invalid GIF: expected signature "GIF", found "' + hdr.sig + '".');
+        }
         hdr.width = st.readUnsigned();
         hdr.height = st.readUnsigned();
 
@@ -276,8 +288,12 @@ var parseGIF = function (st, handler) {
 
             var parseUnknownAppExt = function (block) {
                 block.appData = readSubBlocks();
-                // FIXME: This won't work if a handler wants to match on any identifier.
-                handler.app && handler.app[block.identifier] && handler.app[block.identifier](block);
+                if (!handler.app) return;
+                if (typeof handler.app['*'] === 'function') {
+                    handler.app['*'](block);
+                } else if (typeof handler.app[block.identifier] === 'function') {
+                    handler.app[block.identifier](block);
+                }
             };
 
             var blockSize = st.readByte(); // Always 11
@@ -395,8 +411,11 @@ var parseGIF = function (st, handler) {
                 block.type = 'eof';
                 handler.eof && handler.eof(block);
                 break;
-            default:
-                throw new Error('Unknown block: 0x' + block.sentinel.toString(16)); // TODO: Pad this with a 0.
+            default: {
+                var hx = block.sentinel.toString(16);
+                if (hx.length === 1) hx = '0' + hx;
+                throw new Error('Unknown block: 0x' + hx);
+            }
         }
 
         if (block.type !== 'eof') setTimeout(parseBlock, 0);
@@ -446,6 +465,8 @@ const libgif = function () {
 
         var frames = [];
         var frameOffsets = []; // elements have .x and .y properties
+        /** NETSCAPE extension: 0 = loop forever; >0 = max full animation loops */
+        var netscapeMaxLoops = 0;
 
         var gif = options.gif;
         if (typeof options.auto_play == 'undefined')
@@ -468,13 +489,16 @@ const libgif = function () {
             frame = null;
         };
 
-        // XXX: There's probably a better way to handle catching exceptions when
-        // callbacks are involved.
         var doParse = function () {
             try {
                 parseGIF(stream, handler);
             }
             catch (err) {
+                if (typeof options.on_parse_error === 'function') {
+                    options.on_parse_error(err);
+                } else {
+                    console.error(err);
+                }
                 doLoadError('parse');
             }
         };
@@ -594,7 +618,10 @@ const libgif = function () {
             var currIdx = frames.length;
 
             //ct = color table, gct = global color table
-            var ct = img.lctFlag ? img.lct : hdr.gct; // TODO: What if neither exists?
+            var ct = img.lctFlag ? img.lct : hdr.gct;
+            if (!ct || !ct.length) {
+                throw new Error('GIF frame has no color table (neither global nor local).');
+            }
 
             /*
             Disposal method indicates the way in which the graphic is to
@@ -684,9 +711,8 @@ const libgif = function () {
                 return (i + delta + frames.length) % frames.length;
             };
 
-            var stepFrame = function (amount) { // XXX: Name is confusing.
+            var applyFrameDelta = function (amount) {
                 i = i + amount;
-
                 putFrame();
             };
 
@@ -698,7 +724,13 @@ const libgif = function () {
                         onEndListener(gif);
                     iterationCount++;
 
-                    if (overrideLoopMode !== false || iterationCount < 0) {
+                    if (netscapeMaxLoops > 0 && iterationCount >= netscapeMaxLoops) {
+                        stepping = false;
+                        playing = false;
+                        return;
+                    }
+
+                    if (overrideLoopMode !== false) {
                         doStep();
                     } else {
                         stepping = false;
@@ -710,9 +742,10 @@ const libgif = function () {
                     stepping = playing;
                     if (!stepping) return;
 
-                    stepFrame(1);
+                    applyFrameDelta(1);
                     var delay = frames[i].delay * 10;
-                    if (!delay) delay = 100; // FIXME: Should this even default at all? What should it be?
+                    // GCE delay 0 is undefined; de facto browser default is ~100ms (10 centiseconds).
+                    if (!delay) delay = 100;
 
                     var nextFrameNo = getNextFrameNo();
                     if (nextFrameNo === 0) {
@@ -777,7 +810,7 @@ const libgif = function () {
                 play: play,
                 pause: pause,
                 playing: playing,
-                move_relative: stepFrame,
+                move_relative: applyFrameDelta,
                 current_frame: function () { return i; },
                 length: function () { return frames.length },
                 move_to: function (frame_idx) {
@@ -794,8 +827,7 @@ const libgif = function () {
         var doNothing = function () { };
         /**
          * @param{boolean=} draw Whether to draw progress bar or not; this is not idempotent because of translucency.
-         *                       Note that this means that the text will be unsynchronized with the progress bar on non-frames;
-         *                       but those are typically so small (GCE etc.) that it doesn't really matter. TODO: Do this properly.
+         *                       Progress uses stream byte position (accurate); toolbar text may lag slightly on tiny blocks.
          */
         var withProgress = function (fn, draw = null) {
             return function (block) {
@@ -811,8 +843,9 @@ const libgif = function () {
             com: withProgress(doNothing),
             // I guess that's all for now.
             app: {
-                // TODO: Is there much point in actually supporting iterations?
-                NETSCAPE: withProgress(doNothing)
+                NETSCAPE: withProgress(function (block) {
+                    netscapeMaxLoops = block.iterations;
+                })
             },
             img: withProgress(doImg, true),
             eof: function (block) {
@@ -880,6 +913,7 @@ const libgif = function () {
 
             loading = true;
             frames = [];
+            netscapeMaxLoops = 0;
             clear();
             disposalRestoreFromIdx = null;
             lastDisposalMethod = null;
