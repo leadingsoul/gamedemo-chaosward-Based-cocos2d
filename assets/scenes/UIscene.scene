@@ -990,7 +990,7 @@
     "_id": "15urqsF1FGC7CkTChCIPky"
   },
   {
-    "__type__": "33d6fNCsa5PXpdcMhmODuol",
+    "__type__": "d2563rPiwVM3KoKI8Bcgau4",
     "_name": "",
     "_objFlags": 0,
     "__editorExtras__": {},
@@ -1008,7 +1008,7 @@
     "exitBtn": {
       "__id__": 19
     },
-    "_id": "19EyifXGlDzplA16J9kvmZ"
+    "_id": "86E0vtAVtMbLl/79rgONSM"
   },
   {
     "__type__": "cc.UITransform",
